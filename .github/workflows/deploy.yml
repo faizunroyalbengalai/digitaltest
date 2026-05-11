@@ -1,0 +1,398 @@
+name: Deploy node to DigitalOcean Droplet
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    name: Provision Droplet with Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.server_ip }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.DO_SPACES_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.DO_SPACES_SECRET_KEY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Write SSH public key
+        run: echo "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/id_rsa.pub
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="bucket=${{ secrets.DO_SPACES_BUCKET }}" \
+            -backend-config="region=${{ secrets.DO_SPACES_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="endpoint=https://${{ secrets.DO_SPACES_REGION }}.digitaloceanspaces.com" \
+            -backend-config="access_key=${{ secrets.DO_SPACES_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.DO_SPACES_SECRET_KEY }}"
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="do_token=${{ secrets.DO_TOKEN }}" \
+            -var="region=${{ secrets.DO_REGION }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="public_key=$(cat /tmp/id_rsa.pub)"
+
+      - name: Get server IP
+        id: get_ip
+        working-directory: terraform
+        run: |
+          SERVER_IP=$(terraform output -raw droplet_ip)
+          echo "server_ip=$SERVER_IP" >> "$GITHUB_OUTPUT"
+
+  configure:
+    name: Configure Droplet with Ansible
+    runs-on: ubuntu-latest
+    needs: provision
+    env:
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ansible
+        run: pip install ansible
+
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/id_rsa
+          chmod 600 /tmp/id_rsa
+
+      - name: Wait for SSH to be available
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "Waiting for SSH on $SERVER_IP..."
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/id_rsa root@$SERVER_IP "echo ready" 2>/dev/null; then
+              echo "SSH is available"
+              exit 0
+            fi
+            echo "Attempt $i/30 failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "SSH did not become available in time"
+          exit 1
+
+      - name: Create Ansible inventory
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          cat > /tmp/inventory.ini <<EOF
+          [droplet]
+          $SERVER_IP ansible_user=root ansible_ssh_private_key_file=/tmp/id_rsa ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          EOF
+
+      - name: Create Ansible playbook
+        run: |
+          cat > /tmp/playbook.yml <<'PLAYBOOK'
+          ---
+          - name: Configure Node.js application
+            hosts: droplet
+            become: true
+            vars:
+              app_dir: /opt/app
+              node_version: "20"
+
+            tasks:
+              - name: Update apt cache
+                apt:
+                  update_cache: yes
+                  cache_valid_time: 3600
+
+              - name: Install required system packages
+                apt:
+                  name:
+                    - curl
+                    - git
+                    - nginx
+                    - postgresql
+                    - postgresql-contrib
+                    - python3-psycopg2
+                    - ufw
+                  state: present
+
+              - name: Install Node.js via NodeSource
+                shell: |
+                  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+                  apt-get install -y nodejs
+                args:
+                  executable: /bin/bash
+
+              - name: Install PM2 globally
+                npm:
+                  name: pm2
+                  global: yes
+                  state: present
+
+              - name: Ensure app directory exists
+                file:
+                  path: "{{ app_dir }}"
+                  state: directory
+                  owner: root
+                  group: root
+                  mode: "0755"
+
+              - name: Copy application files
+                synchronize:
+                  src: ./
+                  dest: "{{ app_dir }}/"
+                  delete: yes
+                  rsync_opts:
+                    - "--exclude=.git"
+                    - "--exclude=node_modules"
+                    - "--exclude=.github"
+                    - "--exclude=terraform"
+
+              - name: Install npm dependencies
+                npm:
+                  path: "{{ app_dir }}"
+                  state: present
+
+              - name: Check if package.json has build script
+                shell: |
+                  if node -e "const p=require('{{ app_dir }}/package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
+                    echo "has_build=true"
+                  else
+                    echo "has_build=false"
+                  fi
+                register: build_check
+                args:
+                  executable: /bin/bash
+
+              - name: Run build if build script exists
+                shell: npm run build
+                args:
+                  chdir: "{{ app_dir }}"
+                  executable: /bin/bash
+                when: "'has_build=true' in build_check.stdout"
+
+              - name: Ensure PostgreSQL is started and enabled
+                service:
+                  name: postgresql
+                  state: started
+                  enabled: yes
+
+              - name: Create PostgreSQL database user
+                become_user: postgres
+                postgresql_user:
+                  name: "{{ lookup('env', 'DB_USER') | default('appuser', true) }}"
+                  password: "{{ lookup('env', 'DB_PASSWORD') | default('apppassword', true) }}"
+                  state: present
+                ignore_errors: yes
+
+              - name: Create PostgreSQL database
+                become_user: postgres
+                postgresql_db:
+                  name: "{{ lookup('env', 'DB_NAME') | default('appdb', true) }}"
+                  owner: "{{ lookup('env', 'DB_USER') | default('appuser', true) }}"
+                  state: present
+                ignore_errors: yes
+
+              - name: Write application .env file
+                shell: |
+                  printf 'NODE_ENV=production\nPORT=3000\nDB_HOST=127.0.0.1\nDB_PORT=5432\nDB_NAME=%s\nDB_USER=%s\nDB_PASSWORD=%s\n' \
+                    "${DB_NAME:-appdb}" \
+                    "${DB_USER:-appuser}" \
+                    "${DB_PASSWORD:-apppassword}" \
+                    > {{ app_dir }}/.env
+                args:
+                  executable: /bin/bash
+
+              - name: Delete existing PM2 app if running
+                shell: pm2 delete app 2>/dev/null || true
+                args:
+                  executable: /bin/bash
+
+              - name: Start application with PM2
+                shell: |
+                  cd {{ app_dir }}
+                  pm2 start npm --name app -- start --update-env
+                args:
+                  executable: /bin/bash
+
+              - name: Save PM2 process list
+                shell: pm2 save
+                args:
+                  executable: /bin/bash
+
+              - name: Setup PM2 startup on boot
+                shell: |
+                  pm2 startup systemd -u root --hp /root | tail -1 | bash
+                args:
+                  executable: /bin/bash
+
+              - name: Configure Nginx as reverse proxy
+                copy:
+                  dest: /etc/nginx/sites-available/app
+                  content: |
+                    server {
+                        listen 80;
+                        server_name _;
+
+                        location / {
+                            proxy_pass http://127.0.0.1:3000;
+                            proxy_http_version 1.1;
+                            proxy_set_header Upgrade $http_upgrade;
+                            proxy_set_header Connection 'upgrade';
+                            proxy_set_header Host $host;
+                            proxy_set_header X-Real-IP $remote_addr;
+                            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                            proxy_set_header X-Forwarded-Proto $scheme;
+                            proxy_cache_bypass $http_upgrade;
+                        }
+                    }
+
+              - name: Enable Nginx site
+                file:
+                  src: /etc/nginx/sites-available/app
+                  dest: /etc/nginx/sites-enabled/app
+                  state: link
+
+              - name: Remove default Nginx site
+                file:
+                  path: /etc/nginx/sites-enabled/default
+                  state: absent
+
+              - name: Test Nginx configuration
+                shell: nginx -t
+                args:
+                  executable: /bin/bash
+
+              - name: Restart and enable Nginx
+                service:
+                  name: nginx
+                  state: restarted
+                  enabled: yes
+
+              - name: Configure UFW firewall - allow SSH
+                ufw:
+                  rule: allow
+                  port: "22"
+                  proto: tcp
+
+              - name: Configure UFW firewall - allow HTTP
+                ufw:
+                  rule: allow
+                  port: "80"
+                  proto: tcp
+
+              - name: Configure UFW firewall - allow HTTPS
+                ufw:
+                  rule: allow
+                  port: "443"
+                  proto: tcp
+
+              - name: Enable UFW
+                ufw:
+                  state: enabled
+                  policy: deny
+
+              - name: Wait for application to be ready
+                wait_for:
+                  host: 127.0.0.1
+                  port: 3000
+                  timeout: 60
+                  delay: 5
+                ignore_errors: yes
+                register: app_wait
+
+              - name: Dump PM2 logs on failure
+                shell: pm2 logs app --lines 50 --nostream
+                args:
+                  executable: /bin/bash
+                when: app_wait.failed is defined and app_wait.failed
+
+              - name: Fail if application did not start
+                fail:
+                  msg: "Application failed to start on port 3000. Check PM2 logs above."
+                when: app_wait.failed is defined and app_wait.failed
+
+          PLAYBOOK
+
+      - name: Run Ansible playbook
+        run: |
+          ansible-playbook \
+            -i "${{ needs.provision.outputs.server_ip }}," \
+            /tmp/playbook.yml \
+            --private-key /tmp/id_rsa \
+            -u root
+
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    steps:
+      - name: Check health endpoint
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "Verifying deployment at http://$SERVER_IP/health"
+          for i in $(seq 1 10); do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$SERVER_IP/health" || echo "000")
+            echo "Attempt $i: HTTP status $HTTP_STATUS"
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "Health check passed successfully"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Health check failed after 10 attempts"
+          exit 1
+
+      - name: Print deployment info
+        run: |
+          echo "============================================"
+          echo "Deployment successful!"
+          echo "Application URL: http://${{ needs.provision.outputs.server_ip }}"
+          echo "Health URL:      http://${{ needs.provision.outputs.server_ip }}/health"
+          echo "============================================"
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [provision, verify]
+    if: always()
+    steps:
+      - name: Deployment success notification
+        if: needs.verify.result == 'success'
+        run: |
+          echo "============================================"
+          echo "DEPLOYMENT SUCCEEDED"
+          echo "Project   : ${{ secrets.PROJECT_NAME }}"
+          echo "App       : node"
+          echo "Region    : ${{ secrets.DO_REGION }}"
+          echo "Server IP : ${{ needs.provision.outputs.server_ip }}"
+          echo "URL       : http://${{ needs.provision.outputs.server_ip }}"
+          echo "============================================"
+
+      - name: Deployment failure notification
+        if: needs.verify.result != 'success'
+        run: |
+          echo "============================================"
+          echo "DEPLOYMENT FAILED"
+          echo "Project   : ${{ secrets.PROJECT_NAME }}"
+          echo "App       : node"
+          echo "Region    : ${{ secrets.DO_REGION }}"
+          echo "Server IP : ${{ needs.provision.outputs.server_ip }}"
+          echo "Check logs in the configure and verify jobs above."
+          echo "============================================"
+          exit 1
