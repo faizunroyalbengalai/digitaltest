@@ -31,7 +31,7 @@ jobs:
       - name: Terraform Init
         working-directory: terraform
         run: |
-          terraform init \
+          terraform init -reconfigure \
             -reconfigure \
             -backend-config="bucket=${{ secrets.DO_SPACES_BUCKET }}" \
             -backend-config="region=${{ secrets.DO_SPACES_REGION }}" \
